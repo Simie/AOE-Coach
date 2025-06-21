@@ -1,11 +1,12 @@
-# AOEMeister Discord Bot
+# AOE-Coach Discord Bot
 
 This is a Node.js TypeScript Discord bot that can connect to a voice channel and respond to voice commands using speech-to-text (Deepgram SDK).
 
 ## Features
 - Connects to Discord voice channels
 - Listens for user speech and transcribes it
-- Responds to recognized voice commands
+- Feeds user speech into an OpenAI compatible API endpoint
+- Uses sherpa-onnx TTS to read out the response into the voice channel.
 
 ## Setup
 1. Install dependencies:
