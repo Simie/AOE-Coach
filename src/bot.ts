@@ -2,9 +2,10 @@ import { Client, GatewayIntentBits, VoiceState, TextChannel } from 'discord.js';
 import {
   joinVoiceChannel,
   EndBehaviorType,
-  getVoiceConnection,
+  getVoiceConnection, getVoiceConnections,
   VoiceConnection,
-  VoiceReceiver
+  VoiceReceiver,
+  createAudioResource, StreamType, AudioPlayerStatus, createAudioPlayer
 } from '@discordjs/voice';
 import { createClient as createDeepgramClient } from '@deepgram/sdk';
 import * as dotenv from 'dotenv';
@@ -12,6 +13,8 @@ import { Readable } from 'stream';
 import WebSocket from 'ws';
 import prism from 'prism-media';
 import fetch from 'node-fetch';
+import * as sherpa_onnx from 'sherpa-onnx';
+import { logger } from './logger';
 
 dotenv.config();
 
@@ -44,19 +47,19 @@ const discordClient = new Client({
 const deepgramClient = createDeepgramClient(process.env.DEEPGRAM_API_KEY!);
 
 discordClient.once('ready', () => {
-  console.log(`Logged in as ${discordClient.user?.tag}!`);
+  logger.info('DISCORD', `Logged in as ${discordClient.user?.tag}!`);
 });
 
 discordClient.on('guildCreate', (guild) => {
-  console.log(`Joined new server: ${guild.name} (ID: ${guild.id})`);
+  logger.info('DISCORD', `Joined new server: ${guild.name} (ID: ${guild.id})`);
 });
 
 discordClient.on('guildMemberAdd', (member) => {
-  console.log(`User ${member.user.tag} joined server: ${member.guild.name}`);
+  logger.info('DISCORD', `User ${member.user.tag} joined server: ${member.guild.name}`);
 });
 
 discordClient.on('messageCreate', async (message) => {
-  console.log(`Message in #${message.channel instanceof TextChannel ? message.channel.name : 'unknown'} by ${message.author.tag}: ${message.content}`);
+  logger.debug('DISCORD', `Message in #${message.channel instanceof TextChannel ? message.channel.name : 'unknown'} by ${message.author.tag}: ${message.content}`);
   if (message.content === '!join' && message.member?.voice.channel) {
     message.reply(JOIN_MESSAGE);
 
@@ -68,6 +71,8 @@ discordClient.on('messageCreate', async (message) => {
       selfDeaf: false
     });
 
+    logger.info('DISCORD', `Joined voice channel ${channel.name} in guild ${channel.guild.name}`);
+
     // Initialize voice listeners for all current non-bot users in the channel
     channel.members.forEach((member) => {
       if (!member.user.bot) {
@@ -76,6 +81,8 @@ discordClient.on('messageCreate', async (message) => {
       }
     });
   }
+
+  // Handle !leave command to leave the voice channel
   if (message.content === '!leave') {
     const connection = getVoiceConnection(message.guild!.id);
     if (connection) {
@@ -88,7 +95,7 @@ discordClient.on('messageCreate', async (message) => {
 });
 
 discordClient.on('voiceStateUpdate', async (oldState: VoiceState, newState: VoiceState) => {
-  console.log(`Voice state updated for ${newState.member?.user.tag} in guild ${newState.guild.name}:`);
+  logger.debug('DISCORD', `Voice state updated for ${newState.member?.user.tag} in guild ${newState.guild.name}:`);
   // Only listen if user joins a channel and bot is present in that channel
   const botMember = newState.guild.members.me;
   const botChannel = botMember?.voice.channel;
@@ -115,14 +122,14 @@ discordClient.on('voiceStateUpdate', async (oldState: VoiceState, newState: Voic
     const connection = getVoiceConnection(oldState.guild.id);
     if (connection) {
       connection.destroy();
-      console.log(`Left voice channel ${oldState.channel.name} in guild ${oldState.guild.name} because it was empty.`);
+      logger.info('DISCORD', `Left voice channel ${oldState.channel.name} in guild ${oldState.guild.name} because it was empty.`);
     }
   }
 
   // Clean up Deepgram stream if user leaves the voice channel
   if (oldState.channel && !newState.channel) {
     cleanupUserInChannel(oldState.channel.id, oldState.id);
-    console.log(`[voiceStateUpdate] Cleaned up user state for user ${oldState.id} in channel ${oldState.channel.id}`);
+    logger.debug('DISCORD', `[voiceStateUpdate] Cleaned up user state for user ${oldState.id} in channel ${oldState.channel.id}`);
   }
 });
 
@@ -218,13 +225,13 @@ function subscribeAndTranscribe(receiver: VoiceReceiver, userId: string, voiceSt
     audioStream.on('data', () => {
       if (!hasSpoken) {
         hasSpoken = true;
-        console.log(`User ${userId} started speaking in guild ${voiceState.guild.name}`);
+        logger.debug('DISCORD', `User ${userId} started speaking in guild ${voiceState.guild.name}`);
       }
     });
     audioStream.on('end', () => {
       if (hasSpoken) {
         hasSpoken = false;
-        console.log(`User ${userId} stopped speaking in guild ${voiceState.guild.name} (detected silence)`);
+        logger.debug('DISCORD', `User ${userId} stopped speaking in guild ${voiceState.guild.name} (detected silence)`);
       }
       setImmediate(subscribe);
     });
@@ -234,7 +241,7 @@ function subscribeAndTranscribe(receiver: VoiceReceiver, userId: string, voiceSt
 }
 
 async function transcribeUserAudio(audioStream: Readable, userId: string, voiceState: VoiceState) {
-  console.log(`[transcribeUserAudio] Started listening for voice from user ${userId} in guild ${voiceState.guild.name}`);
+  logger.debug('DISCORD', `[transcribeUserAudio] Started listening for voice from user ${userId} in guild ${voiceState.guild.name}`);
   // No PCM decoding, send Opus stream directly to Deepgram
   let ws: any = null;
   let wsReady = false;
@@ -249,12 +256,12 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
   });
   setupDeepgramHandlers(ws, userId, voiceState);
   ws.setupConnection && ws.setupConnection();
-  console.log(`[transcribeUserAudio] Created Deepgram socket for user ${userId} in guild ${voiceState.guild.name}`);
+  logger.debug('STT', `[transcribeUserAudio] Created Deepgram socket for user ${userId} in guild ${voiceState.guild.name}`);
   ws.on('open', () => {
     wsReady = true;
-    console.log(`[transcribeUserAudio] Deepgram socket opened for user ${userId}`);
+    logger.debug('STT', `[transcribeUserAudio] Deepgram socket opened for user ${userId}`);
     audioStream.on('close', () => {
-      console.log(`[transcribeUserAudio] audioStream closed for user ${userId} in guild ${voiceState.guild.name}`);
+      logger.debug('DISCORD', `[transcribeUserAudio] audioStream closed for user ${userId} in guild ${voiceState.guild.name}`);
     });
   });
   if (ws.readyState === 1) wsReady = true;
@@ -263,36 +270,36 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
       ws.send(chunk);
       sentChunks++;
       if (sentChunks === 1) {
-        console.log(`[transcribeUserAudio] First Opus chunk sent to Deepgram for user ${userId}`);
+        logger.debug('STT', `[transcribeUserAudio] First Opus chunk sent to Deepgram for user ${userId}`);
       }
     } else {
-      console.warn(`[transcribeUserAudio] Deepgram socket not ready for user ${userId}, dropping Opus chunk`);
+      logger.warn('STT', `[transcribeUserAudio] Deepgram socket not ready for user ${userId}, dropping Opus chunk`);
     }
   });
   audioStream.on('end', () => {
-    console.log(`[transcribeUserAudio] Opus stream ended for user ${userId} in guild ${voiceState.guild.name}. Sent ${sentChunks} Opus chunks.`);
+    logger.debug('STT', `[transcribeUserAudio] Opus stream ended for user ${userId} in guild ${voiceState.guild.name}. Sent ${sentChunks} Opus chunks.`);
   });
   audioStream.on('error', (err) => {
-    console.error(`[transcribeUserAudio] Opus stream error for user ${userId}:`, err);
+    logger.error('STT', `[transcribeUserAudio] Opus stream error for user ${userId}:`, err);
   });
   function tryClose() {
     if (resultReceived && ws) {
       if (closeTimeout) clearTimeout(closeTimeout);
-      console.log(`[transcribeUserAudio] Closing Deepgram socket for user ${userId} after receiving result.`);
+      logger.debug('STT', `[transcribeUserAudio] Closing Deepgram socket for user ${userId} after receiving result.`);
       ws.disconnect && ws.disconnect();
       ws.close && ws.close();
     }
   }
   function setupDeepgramHandlers(ws: any, userId: string, voiceState: VoiceState) {
     ws.on('Results', async (data: unknown) => {
-      console.log(`[transcribeUserAudio] Received Results from Deepgram for user ${userId}:`, JSON.stringify(data));
+      logger.debug('STT', `[transcribeUserAudio] Received Results from Deepgram for user ${userId}:`, JSON.stringify(data));
       try {
         if (typeof data === 'object' && data !== null && 'channel' in data) {
           const channel = (data as any).channel;
           const transcript = channel?.alternatives?.[0]?.transcript;
           if (transcript) {
             resultReceived = true;
-            console.log(`[transcribeUserAudio] Voice message from user ${userId} in guild ${voiceState.guild.name}: ${transcript}`);
+            logger.info('STT', `[transcribeUserAudio] Voice message from user ${userId} in guild ${voiceState.guild.name}: ${transcript}`);
             const channelObj = voiceState.guild.channels.cache.get(voiceState.channel!.id);
             if (channelObj && channelObj.isTextBased()) {
               (channelObj as TextChannel).send(`<@${userId}> said: ${transcript}`);
@@ -301,19 +308,21 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
             const openaiReply = await sendTranscriptToOpenAI(transcript);
             if (openaiReply && channelObj) {
               (channelObj as TextChannel).send(`<@${userId}> (AI): ${openaiReply}`);
+              // Speak the OpenAI reply in the voice channel
+              await speakTextInVoiceChannel(openaiReply, voiceState);
             }
           }
         }
         tryClose();
       } catch (err) {
-        console.error(`[transcribeUserAudio] Error parsing Deepgram Results for user ${userId}:`, err);
+        logger.error('STT', `[transcribeUserAudio] Error parsing Deepgram Results for user ${userId}:`, err);
       }
     });
-    ws.on('error', (e: unknown) => console.error(`[transcribeUserAudio] Deepgram socket error for user ${userId}:`, e));
-    ws.on('warning', (e: unknown) => console.warn(`[transcribeUserAudio] Deepgram socket warning for user ${userId}:`, e));
-    ws.on('Metadata', (e: unknown) => console.log(`[transcribeUserAudio] Deepgram socket metadata for user ${userId}:`, e));
+    ws.on('error', (e: unknown) => logger.error('STT', `[transcribeUserAudio] Deepgram socket error for user ${userId}:`, e));
+    ws.on('warning', (e: unknown) => logger.warn('STT', `[transcribeUserAudio] Deepgram socket warning for user ${userId}:`, e));
+    ws.on('Metadata', (e: unknown) => logger.debug('STT', `[transcribeUserAudio] Deepgram socket metadata for user ${userId}:`, e));
     ws.on('close', (e: unknown) => {
-      console.log(`[transcribeUserAudio] Deepgram socket closed for user ${userId}:`, e);
+      logger.debug('STT', `[transcribeUserAudio] Deepgram socket closed for user ${userId}:`, e);
     });
   }
 }
@@ -322,10 +331,10 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
 async function sendTranscriptToOpenAI(transcript: string): Promise<string | null> {
   const apiUrl = process.env.OPENAI_API_URL + '/chat/completions';
   const apiKey = process.env.OPENAI_API_KEY;
-  console.log(`[sendTranscriptToOpenAI] Called with transcript: ${JSON.stringify(transcript)}`);
-  console.log(`[sendTranscriptToOpenAI] Using API URL: ${apiUrl}`);
+  logger.debug('OPENAI', `[sendTranscriptToOpenAI] Called with transcript: ${JSON.stringify(transcript)}`);
+  logger.debug('OPENAI', `[sendTranscriptToOpenAI] Using API URL: ${apiUrl}`);
   if (!apiKey) {
-    console.warn('[sendTranscriptToOpenAI] No OPENAI_API_KEY set, skipping OpenAI call.');
+    logger.warn('OPENAI', '[sendTranscriptToOpenAI] No OPENAI_API_KEY set, skipping OpenAI call.');
     return null;
   }
   try {
@@ -336,7 +345,7 @@ async function sendTranscriptToOpenAI(transcript: string): Promise<string | null
         { role: 'user', content: transcript }
       ]
     };
-    console.log(`[sendTranscriptToOpenAI] Sending payload: ${JSON.stringify(payload)}`);
+    logger.debug('OPENAI', `[sendTranscriptToOpenAI] Sending payload: ${JSON.stringify(payload)}`);
     const response = await fetch(apiUrl, {
       method: 'POST',
       headers: {
@@ -345,45 +354,162 @@ async function sendTranscriptToOpenAI(transcript: string): Promise<string | null
       },
       body: JSON.stringify(payload)
     });
-    console.log(`[sendTranscriptToOpenAI] Response status: ${response.status} ${response.statusText}`);
+    logger.debug('OPENAI', `[sendTranscriptToOpenAI] Response status: ${response.status} ${response.statusText}`);
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`[sendTranscriptToOpenAI] OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
+      logger.error('OPENAI', `[sendTranscriptToOpenAI] OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
       return null;
     }
     const data = await response.json();
-    console.log(`[sendTranscriptToOpenAI] OpenAI API response: ${JSON.stringify(data)}`);
+    logger.debug('OPENAI', `[sendTranscriptToOpenAI] OpenAI API response: ${JSON.stringify(data)}`);
     const reply = data.choices?.[0]?.message?.content;
     return reply || null;
   } catch (err) {
-    console.error('[sendTranscriptToOpenAI] Error calling OpenAI API:', err);
+    logger.error('OPENAI', '[sendTranscriptToOpenAI] Error calling OpenAI API:', err);
     return null;
   }
 }
 
+function createTts(){
+
+  let offlineTtsVitsModelConfig = {
+      model: 'models/tts/vits-piper-en_GB-alan-medium/en_GB-alan-medium.onnx',
+      dataDir: 'models/tts/vits-piper-en_GB-alan-medium/espeak-ng-data',
+      tokens: 'models/tts/vits-piper-en_GB-alan-medium/tokens.txt',
+      noiseScale: 0.667,
+      noiseScaleW: 0.8,
+      lengthScale: 1.0,
+  };
+  let offlineTtsModelConfig = {
+    offlineTtsVitsModelConfig: offlineTtsVitsModelConfig,
+    numThreads: 1,
+    debug: 0,
+    provider: 'cpu',
+  };
+  let offlineTtsConfig = {
+    offlineTtsModelConfig: offlineTtsModelConfig,
+    maxNumSentences: 1,
+  };
+
+  return sherpa_onnx.createOfflineTts(offlineTtsConfig);
+}
+
+// sherpa-onnx TTS config (adjust as needed)
+const tts = createTts();
+
+// Helper: Speak text in a Discord voice channel using sherpa-onnx TTS
+async function speakTextInVoiceChannel(text: string, voiceState: VoiceState) {
+  const channel = voiceState.channel;
+  if (!channel) {
+    logger.warn('DISCORD', '[TTS] No voice channel found for user.');
+    return;
+  }
+  const connection = getVoiceConnection(channel.guild.id) as VoiceConnection | undefined;
+  if (!connection) {
+    logger.warn('DISCORD', '[TTS] No active voice connection for guild:', channel.guild.id);
+    return;
+  }
+
+  connection.setSpeaking(true);
+
+  let ffmpeg: any = null;
+  let opusStream: any = null;
+  let player: any = null;
+  try {
+    const audio = await tts.generate({
+      text,
+      sid: 0, // speaker id, if supported by the model
+      speed: 1.4,
+    });
+    // audio.samples: Float32Array, audio.sampleRate: number
+    // Convert Float32Array PCM to Buffer (16-bit PCM LE, mono)
+    const monoPcmBuffer = Buffer.alloc(audio.samples.length * 2);
+    for (let i = 0; i < audio.samples.length; ++i) {
+      let s = Math.max(-1, Math.min(1, audio.samples[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      monoPcmBuffer.writeInt16LE(s, i * 2);
+    }
+    // Convert mono PCM to stereo PCM (duplicate each sample)
+    const stereoPcmBuffer = Buffer.alloc(monoPcmBuffer.length * 2);
+    for (let i = 0; i < monoPcmBuffer.length; i += 2) {
+      monoPcmBuffer.copy(stereoPcmBuffer, i * 2, i, i + 2); // left
+      monoPcmBuffer.copy(stereoPcmBuffer, i * 2 + 2, i, i + 2); // right
+    }
+    const pcmStream = Readable.from(stereoPcmBuffer);
+    let inputSampleRate = audio.sampleRate;
+    logger.debug('SHERPA', `[TTS] sherpa-onnx output sampleRate: ${inputSampleRate}`);
+    let ffmpegArgs = [
+      '-f', 's16le',
+      '-ar', inputSampleRate.toString(),
+      '-ac', '2',
+      '-i', 'pipe:0',
+      '-ar', '48000',
+      '-ac', '2',
+      '-f', 's16le', // output format must be right before output
+    ];
+    ffmpeg = new prism.FFmpeg({ args: ffmpegArgs });
+    // Log FFmpeg stderr for debugging
+    if (ffmpeg && ffmpeg.process && ffmpeg.process.stderr) {
+      ffmpeg.process.stderr.on('data', (chunk: Buffer) => {
+        logger.debug('DISCORD', '[TTS] FFmpeg stderr:', chunk.toString());
+      });
+    }
+    ffmpeg.on('error', (err: any) => {
+      if (err.code === 'EOF' || (err.message && err.message.includes('write EOF'))) {
+        // Ignore write EOF if it happens after stream end
+        logger.warn('FFMPEG', '[TTS] FFmpeg stream received write EOF (likely normal for short audio)');
+      } else {
+        logger.error('FFMPEG', '[TTS] FFmpeg stream error:', err);
+      }
+    });
+    const resampledStream = pcmStream.pipe(ffmpeg);
+    opusStream = resampledStream.pipe(new prism.opus.Encoder({
+      rate: 48000,
+      channels: 2,
+      frameSize: 960
+    }));
+    opusStream.on('error', (err: any) => {
+      logger.error('FFMPEG', '[TTS] Opus encoder stream error:', err);
+    });
+    const resource = createAudioResource(opusStream, { inputType: StreamType.Opus });
+    player = createAudioPlayer();
+    player.on('error', (err: any) => {
+      logger.error('DISCORD', '[TTS] Audio player error:', err);
+    });
+    connection.subscribe(player);
+    player.play(resource);
+    player.once(AudioPlayerStatus.Idle, () => {
+      player.stop();
+      // Clean up streams
+      if (opusStream && opusStream.destroy) opusStream.destroy();
+      if (ffmpeg && ffmpeg.destroy) ffmpeg.destroy();
+
+    connection.setSpeaking(false);
+    logger.info('DISCORD', '[TTS] Finished playing TTS audio for:', voiceState.member?.user.tag);
+
+    });
+  } catch (err) {
+    logger.error('DISCORD', '[TTS] Error generating or playing TTS:', err);
+  }
+  // Do not call tts.free() here; only free on shutdown
+}
+
 // Gracefully leave all voice channels on shutdown
 const cleanup = async (crashMessage?: string) => {
-  console.log('Shutting down, leaving all voice channels...');
+  logger.info('DISCORD', 'Shutting down, leaving all voice channels...');
   await closeAllDeepgramStreams();
   // Leave all voice channels by disconnecting the bot from each guild
   for (const [guildId, connection] of getVoiceConnectionStore() as IterableIterator<[string, VoiceConnection]>) {
-    console.log(`Leaving voice channel for guild ${guildId}`);
+    logger.info('DISCORD', `Leaving voice channel for guild ${guildId}`);
     try {
-      // Attempt to send a message to the text channel associated with the voice channel
-      const guild = discordClient.guilds.cache.get(guildId);
-      if (guild) {
-        const botMember = guild.members.me;
-        if (botMember && botMember.voice.channel) {
-          if(crashMessage) {
-            botMember.voice.channel.send(crashMessage);
-          }
-          console.log(`Left voice channel in guild ${guild.name}`);
-        }
+      if(connection.disconnect()) {
+        logger.info('DISCORD', `Left voice channel in guild ${guildId}`);
+      } else {
+        logger.warn('DISCORD', `Failed ot leave voice channel in guild ${guildId}`);
       }
-      connection.disconnect(); // Disconnect from the voice channel
       connection.destroy();    // Ensure resources are cleaned up
     } catch (err) {
-      console.error(`Error leaving voice channel for guild ${guildId}:`, err);
+      logger.error('DISCORD', `Error leaving voice channel for guild ${guildId}:`, err);
     }
   }
   process.exit(0);
@@ -394,22 +520,20 @@ process.on('SIGTERM', () => cleanup(SHUTDOWN_MESSAGE));
 
 // Handle uncaught exceptions and unhandled rejections to ensure cleanup
 process.on('uncaughtException', async (err) => {
-  console.error('Uncaught Exception:', err);
+  logger.error('DISCORD', 'Uncaught Exception:', err);
   await cleanup(CRASH_MESSAGE);
   process.exit(1);
 });
 
 process.on('unhandledRejection', async (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('DISCORD', 'Unhandled Rejection at:', promise, 'reason:', reason);
   await cleanup(CRASH_MESSAGE);
   process.exit(1);
 });
 
 // Helper to get all active voice connections
 function getVoiceConnectionStore(): IterableIterator<[string, VoiceConnection]> {
-  // @discordjs/voice v0.8+ stores connections in a Map
-  // @ts-ignore
-  return require('@discordjs/voice').getVoiceConnections().entries();
+  return getVoiceConnections().entries();
 }
 
 discordClient.login(process.env.DISCORD_TOKEN);
