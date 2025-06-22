@@ -14,11 +14,11 @@ import WebSocket from 'ws';
 import prism from 'prism-media';
 import fetch from 'node-fetch';
 import * as sherpa_onnx from 'sherpa-onnx';
-import { logger } from './logger';
 import * as fs from 'fs';
 import * as path from 'path';
 
 dotenv.config();
+import { logger } from './logger';
 
 // Customisable leave/crash messages
 const JOIN_MESSAGE = "On my way to help the boys!";
@@ -277,6 +277,7 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
     sample_rate: 48000, // Discord Opus is 48kHz
     interim_results: false, // Get interim results
     keyterms: KEY_TERMS, // Pass loaded key terms here
+    endpointing: false, // Disable endpointing to handle our own silence detection
   });
   setupDeepgramHandlers(ws, userId, voiceState);
   ws.setupConnection && ws.setupConnection();
