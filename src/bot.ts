@@ -277,7 +277,7 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
     sample_rate: 48000, // Discord Opus is 48kHz
     interim_results: false, // Get interim results
     keyterms: KEY_TERMS, // Pass loaded key terms here
-    endpointing: false, // Disable endpointing to handle our own silence detection
+    //endpointing: false, // Disable endpointing to handle our own silence detection
   });
   setupDeepgramHandlers(ws, userId, voiceState);
   ws.setupConnection && ws.setupConnection();
