@@ -15,6 +15,8 @@ import prism from 'prism-media';
 import fetch from 'node-fetch';
 import * as sherpa_onnx from 'sherpa-onnx';
 import { logger } from './logger';
+import * as fs from 'fs';
+import * as path from 'path';
 
 dotenv.config();
 
@@ -240,6 +242,26 @@ function subscribeAndTranscribe(receiver: VoiceReceiver, userId: string, voiceSt
   subscribe();
 }
 
+
+// Load key terms from config file
+function loadKeyTerms(configPath: string): string[] {
+  try {
+    const absPath = path.resolve(configPath);
+    if (!fs.existsSync(absPath)) return [];
+    const lines = fs.readFileSync(absPath, 'utf-8')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('#'));
+    return lines;
+  } catch (err) {
+    logger.warn('CONFIG', `Failed to load key terms from ${configPath}:`, err);
+    return [];
+  }
+}
+
+// At the top-level, load key terms once
+const KEY_TERMS = loadKeyTerms('./keyterms.txt');
+
 async function transcribeUserAudio(audioStream: Readable, userId: string, voiceState: VoiceState) {
   logger.debug('DISCORD', `[transcribeUserAudio] Started listening for voice from user ${userId} in guild ${voiceState.guild.name}`);
   // No PCM decoding, send Opus stream directly to Deepgram
@@ -252,7 +274,9 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
     model: 'nova',
     smart_format: true,
     encoding: 'opus', // Tell Deepgram we're sending Opus
-    sample_rate: 48000 // Discord Opus is 48kHz
+    sample_rate: 48000, // Discord Opus is 48kHz
+    interim_results: false, // Get interim results
+    keyterms: KEY_TERMS, // Pass loaded key terms here
   });
   setupDeepgramHandlers(ws, userId, voiceState);
   ws.setupConnection && ws.setupConnection();
