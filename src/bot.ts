@@ -290,6 +290,7 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
       ws.close && ws.close();
     }
   }
+    
   function setupDeepgramHandlers(ws: any, userId: string, voiceState: VoiceState) {
     ws.on('Results', async (data: unknown) => {
       logger.debug('STT', `[transcribeUserAudio] Received Results from Deepgram for user ${userId}:`, JSON.stringify(data));
@@ -299,18 +300,7 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
           const transcript = channel?.alternatives?.[0]?.transcript;
           if (transcript) {
             resultReceived = true;
-            logger.info('STT', `[transcribeUserAudio] Voice message from user ${userId} in guild ${voiceState.guild.name}: ${transcript}`);
-            const channelObj = voiceState.guild.channels.cache.get(voiceState.channel!.id);
-            if (channelObj && channelObj.isTextBased()) {
-              (channelObj as TextChannel).send(`<@${userId}> said: ${transcript}`);
-            }
-            // Send transcript to OpenAI and reply with the response
-            const openaiReply = await sendTranscriptToOpenAI(transcript);
-            if (openaiReply && channelObj) {
-              (channelObj as TextChannel).send(`<@${userId}> (AI): ${openaiReply}`);
-              // Speak the OpenAI reply in the voice channel
-              await speakTextInVoiceChannel(openaiReply, voiceState);
-            }
+            await onUserSpeak(transcript, userId, voiceState);
           }
         }
         tryClose();
@@ -324,6 +314,43 @@ async function transcribeUserAudio(audioStream: Readable, userId: string, voiceS
     ws.on('close', (e: unknown) => {
       logger.debug('STT', `[transcribeUserAudio] Deepgram socket closed for user ${userId}:`, e);
     });
+  }
+}
+
+// Handles what happens when a user says something (transcript received)
+async function onUserSpeak(transcript: string, userId: string, voiceState: VoiceState) {
+  logger.info('BOT', `[onUserSpeak] Voice message from user ${userId} in guild ${voiceState.guild.name}: ${transcript}`);
+  const channelObj = voiceState.guild.channels.cache.get(voiceState.channel!.id);
+  if (channelObj && channelObj.isTextBased()) {
+    (channelObj as TextChannel).send(`<@${userId}> said: ${transcript}`);
+  }
+
+  // If "coach" appears in the first 3 words, use everything after "coach"
+  const words = transcript.trim().split(/\s+/);
+  const coachIndex = words.findIndex((w) => w.replace(/[^a-z]/gi, '').toLowerCase() === 'coach');
+  let openaiInput: string | null = null;
+
+  if (coachIndex !== -1 && coachIndex < 3) {
+    logger.debug('BOT', `[onUserSpeak] Found "coach" in first 3 words at index ${coachIndex} in transcript: ${transcript}`);
+    openaiInput = words.slice(coachIndex + 1).join(' ').trim();
+  } else {
+    // Fallback to listening for specifically "hey coach", then take everything after that
+    const match = transcript.match(/^\s*hey[, ]+coach[!,. ]+(.*)$/i);
+    if (match && match[1]?.trim()) {
+      openaiInput = match[1].trim();
+      logger.debug('BOT', `[onUserSpeak] Found "hey coach" trigger phrase in transcript, using input: ${match[1].trim()}`);
+    }
+  }
+
+  if (openaiInput) {
+    const openaiReply = await sendTranscriptToOpenAI(openaiInput);
+    if (openaiReply && channelObj) {
+      (channelObj as TextChannel).send(`<@${userId}> (AI): ${openaiReply}`);
+      // Speak the OpenAI reply in the voice channel
+      await speakTextInVoiceChannel(openaiReply, voiceState);
+    }
+  } else {
+      logger.debug('BOT', `[onUserSpeak] Trigger phrase not found.`);
   }
 }
 
